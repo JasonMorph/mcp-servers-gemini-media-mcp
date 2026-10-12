@@ -127,9 +127,9 @@ A request flows like this. An MCP tool call reaches `server`, which attaches pro
 - **Locations are per model, from the catalog.** Veo uses `us-central1`; images, Lyria and TTS use `global`. An explicit location is honored where the model is offered and overridden with a warning where it is not. One genai client is pooled per location.
 - **Key migration warning.** `doctor` warns about standard `AIza…` Gemini API keys, which Google is migrating to `AQ.…` authorization keys. `configure --api-key-stdin` writes a `0600` config file for harnesses that don't forward environment variables (Gemini CLI redacts `*KEY*` variables; Agent Plugins forbids secrets in `env`).
 
-### 2.3 Tool surface: 12 workflow-shaped tools
+### 2.3 Tool surface: 14 workflow-shaped tools
 
-| v0 (12 tools) | v1 (12 tools) | Why |
+| v0 (12 tools) | v1 (14 tools) | Why |
 |---|---|---|
 | `generate_image`, `compose_images` | `generate_image` (+ `referenceImages` up to 14, `count` 1–4, `googleSearch`, `imageSize` 1K–4K, 512 only on Nano Banana 2) | Composition is generation with references. Fewer overlapping tools improve selection accuracy (RAG-MCP, arXiv:2505.03275). |
 | `edit_image` | `edit_image` (+ references, aspect ratio / outpainting, size; defaults to the model that made the source) | Consistent quality across edit chains. |
@@ -142,6 +142,7 @@ A request flows like this. An MCP tool call reaches `server`, which attaches pro
 | `list_models` | `list_models` (`mediaType`, `detail`, `live`, `includeInactive`) | Discovery and availability checks. |
 | `get_config` | `get_config` (backend reason, setting sources, warnings; never secrets) | Troubleshooting. |
 | — | `estimate_cost`, `get_usage` | Spend awareness. |
+| — | `tile_image`, `stitch_tiles` (local, free) | Upscaling past the 4K output limit: crops shaped to the model's ratios, then registration and blending of the re-rendered tiles (see 2.9). |
 
 Tool design follows Anthropic's [Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents) and the findings of *MCP Tool Descriptions Are Smelly!* (arXiv:2602.14878: precise, purpose-first descriptions help; long ones add steps):
 
@@ -240,6 +241,31 @@ One repository serves every harness from a single canonical `skills/` directory.
 A release is one tag. `scripts/sync-version.sh` stamps the version into every manifest, and `scripts/validate-packaging.sh` (also run in CI) checks versions, schemas and layout, calling `claude plugin validate`, `mcpb validate` and `mcp-publisher validate` when those tools are installed. `release.yml` then runs GoReleaser, the MCPB bundle, the GHCR image and the registry publish. Per-client install snippets are in [`packaging/INSTALL-SNIPPETS.md`](../packaging/INSTALL-SNIPPETS.md).
 
 ---
+
+### 2.9 Tiled upscaling past 4K
+
+Nano Banana renders at most 4K. A widely shared workflow gets past that limit:
+
+- cut the photo into overlapping crops;
+- have the model re-render each crop at 4K with the full photo as context;
+- stitch the crops back together;
+- repeat on faces and other details.
+
+Everything except the model calls is deterministic image processing, so it lives in the server (`internal/tiles`), not in each agent's scratch scripts:
+
+- **`tile_image`** plans a grid, or regions chosen by the agent. Given a target long edge (1K-16K), it picks the cheapest grid and edit size whose tiles cover it: one tile up to about 4K, which also covers small-image upscales, and a 2x2-4x4 grid of 4K tiles beyond. A crop that no supported ratio fits inside the image extends past the border, mirrored there and discarded when stitching. Each crop is padded and then grown to the nearest aspect ratio the edit model supports, read from the catalog. The model therefore returns a pure scale-up of the crop. The tool saves the crops, a reference copy of the original (at most 2048 px, since the model samples inputs at about 1K) and a job file. It reports the cost of editing every tile, and how much model-rendered detail the output will carry versus interpolation.
+- **`stitch_tiles`** registers each tile against the tiled image at that image's own resolution:
+  - search: an exhaustive coarse search over scale and shift, then a pattern search over independent x/y scale and sub-pixel shift on a pyramid, using normalized cross-correlation of blurred luma;
+  - rejection: a tile whose shape, structure or framing does not match;
+  - color: a smooth low-frequency per-channel offset matches broad exposure and color without copying old texture;
+  - blending: tiles are combined as a weighted average whose fades are at most half of each overlap, and the base image keeps only the weight left over, so it shows only where no tile was placed.
+
+  An 8K stitch of nine 4K tiles takes about 16 s on four cores. Tiles are decoded two at a time, and the next tile is resampled while the current one is painted. Peak heap use is under 1 GB.
+- Live testing shaped the workflow:
+  - On a 121 px portrait taken to 8K, all nine pass-1 tiles aligned with matches of 0.98-1.00, after one tile the model had zoomed out was rejected and retried.
+  - Refinement passes send the crop alone. Next to a close-up, the whole-photo reference made the model redraw the whole photo, which `stitch_tiles` rejected.
+  - With 4K tiles, pass 1 already renders about 10,000 px of detail for an 8K output. Tight regions re-rendered at 2.4x came back no sharper, so later passes fix content (a pair of mismatched irises) but add resolution only when the output exceeds what pass 1 renders. The skill therefore runs one pass plus targeted fixes, not the 2-3 passes of the original workflow. `tile_image` reports when an image is already saturated, and otherwise warns about regions too large to gain detail.
+- Both tools are free and make no network calls. The agent runs the paid `edit_image` calls in between, in parallel, under the usual budgets and approvals. The `gemini-upscale` skill holds the prompt, region choice and review loop. It states that the added detail is invented, not recovered.
 
 ## 3. What I deliberately did not do (follow-ups)
 
